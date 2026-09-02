@@ -90,8 +90,11 @@ def search_news(
     values: list[Any] = []
     if query:
         term = f"%{escape_like(query)}%"
-        where.append("(title LIKE ? ESCAPE '\\' OR stock_name LIKE ? ESCAPE '\\' OR category LIKE ? ESCAPE '\\')")
-        values.extend((term, term, term))
+        where.append(
+            "(title LIKE ? ESCAPE '\\' OR stock_name LIKE ? ESCAPE '\\' "
+            "OR category LIKE ? ESCAPE '\\' OR document_text LIKE ? ESCAPE '\\')"
+        )
+        values.extend((term, term, term, term))
     if stock_code:
         normalized_code = stock_code.zfill(5) if stock_code.isdigit() else stock_code
         escaped_code = escape_like(normalized_code)
@@ -130,7 +133,8 @@ def get_news(news_id: str) -> dict[str, Any]:
         row = connection.execute(
             """
             SELECT news_id, release_time, stock_code, stock_name, category, title,
-                   file_info, file_type, document_url, display_url, security_status, raw_json
+                   file_info, file_type, document_url, display_url, security_status,
+                   document_text, document_downloaded_at, document_error, raw_json
             FROM news WHERE news_id = ?
             """,
             (news_id,),

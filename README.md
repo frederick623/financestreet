@@ -21,6 +21,8 @@ and re-download the previous sync date to capture late postings safely:
 
 Use `--security-status current` or `--security-status delisted` to synchronize
 only one list. The database is stored at `data/hkex_news.db`.
+Sync progress is printed to the terminal and logged to `data/hkex_news.log`;
+use `--log-file PATH` to select a different log file.
 
 ## MCP server
 
@@ -42,5 +44,18 @@ For another local MCP client, add the equivalent server configuration:
 }
 ```
 
-The server provides `database_status`, `search_news`, `get_news`, and
-`list_categories`. It only opens the SQLite database in read-only mode.
+During sync, each linked PDF is downloaded and its extracted text is stored in
+the `news.document_text` column. HKEX's `file_type` field identifies most PDFs;
+the stored `document_url` also normally ends in `.pdf` and is used as a fallback
+when that field is absent. Failed downloads retain an error in
+`news.document_error` and are retried on the next overlapping sync. The server
+provides `database_status`, `search_news`, `get_news`, and `list_categories`;
+`search_news` searches document text and `get_news` returns it. It only opens
+the SQLite database in read-only mode. PDF downloads are spaced by a random
+1–300 second delay, and sync reports whether each PDF was skipped, downloaded,
+stored, or failed. To process every stored PDF from every date without making a
+new HKEX search, run `backfill-pdfs`:
+
+```bash
+.venv/bin/python hkex_store.py backfill-pdfs
+```
