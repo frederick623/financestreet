@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import html
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import json
 import logging
@@ -28,10 +30,154 @@ from pypdf.errors import PdfReadError
 
 
 DEFAULT_DATABASE = Path(__file__).parent / "data" / "hkex_news.db"
+DEFAULT_SECTOR_FILE = Path(__file__).parent / "sector.csv"
 HK_TIMEZONE = ZoneInfo("Asia/Hong_Kong")
 TAG_PATTERN = re.compile(r"<[^>]+>")
 MAX_PDF_BYTES = 50 * 1024 * 1024
 LOGGER = logging.getLogger(__name__)
+
+SECTOR_PHRASES = {
+    "Financials": (
+        "banking",
+        "commercial bank",
+        "insurance",
+        "asset management",
+        "investment management",
+        "securities brokerage",
+        "financial services",
+        "money lending",
+        "wealth management",
+    ),
+    "Information Technology": (
+        "software",
+        "semiconductor",
+        "information technology",
+        "it services",
+        "cloud computing",
+        "cybersecurity",
+        "computer hardware",
+        "data centre",
+        "data center",
+    ),
+    "Health Care": (
+        "pharmaceutical",
+        "biotechnology",
+        "biotech",
+        "medical device",
+        "medical equipment",
+        "hospital",
+        "healthcare services",
+        "health care services",
+        "immuno-oncology",
+        "new drugs",
+        "innovative drug",
+    ),
+    "Consumer Discretionary": (
+        "non-essential consumer",
+        "automobile",
+        "motor vehicle",
+        "vehicle dealership",
+        "department store",
+        "fashion retail",
+        "apparel",
+        "home appliances",
+        "education services",
+        "restaurant",
+        "hotel",
+        "tourism",
+        "travel services",
+        "leisure",
+        "jewellery",
+        "jewelry",
+    ),
+    "Consumer Staples": (
+        "food and beverage",
+        "food products",
+        "beverage",
+        "dairy",
+        "household products",
+        "personal care products",
+        "supermarket",
+        "grocery",
+        "agricultural products",
+    ),
+    "Energy": (
+        "oil and gas",
+        "crude oil",
+        "natural gas",
+        "petroleum",
+        "coal mining",
+        "coal production",
+        "renewable energy",
+        "solar power",
+        "wind power",
+    ),
+    "Industrials": (
+        "manufacturing",
+        "aerospace",
+        "defence",
+        "defense",
+        "transportation",
+        "logistics",
+        "freight forwarding",
+        "industrial machinery",
+        "construction services",
+        "building maintenance",
+        "renovation services",
+    ),
+    "Materials": (
+        "chemicals",
+        "chemical products",
+        "metal mining",
+        "mining and processing",
+        "iron ore",
+        "non-ferrous metal",
+        "paper products",
+        "packaging products",
+        "cement",
+        "building materials",
+    ),
+    "Real Estate": (
+        "real estate investment trust",
+        "property development",
+        "property investment",
+        "property management",
+        "real estate development",
+        "real estate management",
+    ),
+    "Communication Services": (
+        "telecommunications",
+        "telecommunication services",
+        "media and entertainment",
+        "internet platform",
+        "online platform",
+        "online games",
+        "online entertainment",
+        "digital media",
+        "advertising services",
+        "film production",
+        "television broadcasting",
+        "publishing",
+    ),
+    "Utilities": (
+        "electric utility",
+        "electricity generation",
+        "power generation",
+        "gas utility",
+        "water utility",
+        "water supply",
+        "sewage treatment",
+    ),
+}
+BUSINESS_MARKERS = re.compile(
+    r"\b(?:principal(?:ly)? (?:activities|activity|business|businesses|engaged)|"
+    r"mainly engaged|primarily engaged)\b",
+    re.IGNORECASE,
+)
+
+
+class PDFContentError(HKEXError):
+    """Raised when a downloaded PDF cannot be processed and should be ignored."""
 
 
 @dataclass(frozen=True)
@@ -81,14 +227,28 @@ def connect(database: Path) -> sqlite3.Connection:
             synced_at TEXT NOT NULL,
             document_text TEXT,
             document_downloaded_at TEXT,
-            document_error TEXT
+            document_error TEXT,
+            document_ignored_at TEXT,
+            sector TEXT
         );
         CREATE INDEX IF NOT EXISTS news_release_time_idx ON news(release_time DESC);
         CREATE INDEX IF NOT EXISTS news_stock_code_idx ON news(stock_code, release_time DESC);
+        CREATE TABLE IF NOT EXISTS invalid_document_urls (
+            document_url TEXT PRIMARY KEY,
+            reason TEXT NOT NULL,
+            ignored_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS sync_state (
             security_status TEXT PRIMARY KEY CHECK (security_status IN ('current', 'delisted')),
             last_to_date TEXT NOT NULL,
             synced_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS company_sectors (
+            stock_name TEXT PRIMARY KEY,
+            sector TEXT NOT NULL,
+            source_news_id TEXT NOT NULL,
+            evidence TEXT NOT NULL,
+            classified_at TEXT NOT NULL
         );
         """
     )
@@ -97,10 +257,205 @@ def connect(database: Path) -> sqlite3.Connection:
         ("document_text", "TEXT"),
         ("document_downloaded_at", "TEXT"),
         ("document_error", "TEXT"),
+        ("document_ignored_at", "TEXT"),
+        ("sector", "TEXT"),
     ):
         if column not in columns:
             connection.execute(f"ALTER TABLE news ADD COLUMN {column} {definition}")
     return connection
+
+
+def load_sector_names(sector_file: Path) -> set[str]:
+    """Read and validate the sector taxonomy used by the classifier."""
+    with sector_file.open(encoding="utf-8", newline="") as source:
+        reader = csv.DictReader(source, delimiter="\t")
+        if reader.fieldnames != ["Sector", "Key Industries", "Nature"]:
+            raise ValueError(
+                f"{sector_file} must have Sector, Key Industries, and Nature columns."
+            )
+        sectors = {row["Sector"].strip() for row in reader if row["Sector"].strip()}
+    missing_rules = sectors - SECTOR_PHRASES.keys()
+    unknown_rules = SECTOR_PHRASES.keys() - sectors
+    if missing_rules or unknown_rules:
+        raise ValueError(
+            "Sector taxonomy and classification rules differ: "
+            f"missing rules={sorted(missing_rules)}, unknown rules={sorted(unknown_rules)}"
+        )
+    return sectors
+
+
+def business_passages(document_text: str) -> list[str]:
+    """Extract issuer-business passages and exclude incidental document mentions."""
+    normalized = " ".join(document_text.split())
+    passages: list[str] = []
+    for match in BUSINESS_MARKERS.finditer(normalized):
+        start = max(0, match.start() - 120)
+        end = min(len(normalized), match.end() + 600)
+        passages.append(normalized[start:end])
+        if len(passages) == 12:
+            break
+    return passages
+
+
+def classify_document_sector(document_text: str) -> tuple[str, str] | None:
+    """Classify a document when its business passages support one clear sector."""
+    passages = business_passages(document_text)
+    if not passages:
+        return None
+    for passage in passages:
+        marker = BUSINESS_MARKERS.search(passage)
+        if marker is None:
+            continue
+        sentence_end = passage.find(".", marker.end() + 20)
+        scope_end = sentence_end + 1 if sentence_end >= 0 else len(passage)
+        scope = passage[marker.start() : min(scope_end, marker.start() + 450)]
+        text = scope.casefold()
+        scores: dict[str, int] = {}
+        matched_phrases: dict[str, list[str]] = {}
+        for sector, phrases in SECTOR_PHRASES.items():
+            matches = [
+                phrase
+                for phrase in phrases
+                if re.search(rf"\b{re.escape(phrase)}s?\b", text)
+            ]
+            if matches:
+                matched_phrases[sector] = matches
+                scores[sector] = sum(3 if " " in phrase else 2 for phrase in matches)
+        if not scores:
+            continue
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        winner, winner_score = ranked[0]
+        runner_up_score = ranked[1][1] if len(ranked) > 1 else 0
+        if winner_score >= 2 and winner_score - runner_up_score >= 2:
+            return winner, scope
+    return None
+
+
+class IssuerGroups:
+    """Connect issuer names that share any stock code, including multi-code rows."""
+
+    def __init__(self, rows: list[tuple[str, str]]) -> None:
+        self.parent: dict[str, str] = {}
+        for stock_code, stock_name in rows:
+            identifiers = [f"name:{stock_name}"]
+            identifiers.extend(f"code:{code}" for code in stock_code.split())
+            for identifier in identifiers:
+                self.parent.setdefault(identifier, identifier)
+            for identifier in identifiers[1:]:
+                self.union(identifiers[0], identifier)
+
+    def find(self, identifier: str) -> str:
+        parent = self.parent[identifier]
+        if parent != identifier:
+            self.parent[identifier] = self.find(parent)
+        return self.parent[identifier]
+
+    def union(self, left: str, right: str) -> None:
+        left_root = self.find(left)
+        right_root = self.find(right)
+        if left_root != right_root:
+            self.parent[right_root] = left_root
+
+    def issuer(self, stock_name: str) -> str:
+        return self.find(f"name:{stock_name}")
+
+
+def classify_company_sectors(
+    connection: sqlite3.Connection, sector_file: Path
+) -> tuple[int, int]:
+    """Reuse known issuer sectors, then classify and propagate previously unseen ones."""
+    sector_names = load_sector_names(sector_file)
+    issuer_rows = [
+        (stock_code, stock_name)
+        for stock_code, stock_name in connection.execute(
+            """
+            SELECT DISTINCT stock_code, stock_name
+            FROM news
+            WHERE trim(stock_code) <> '' AND trim(stock_name) <> ''
+            """
+        )
+    ]
+    groups = IssuerGroups(issuer_rows)
+    classified: dict[str, tuple[str, str, str]] = {}
+    for stock_name, sector, news_id, evidence in connection.execute(
+        """
+        SELECT stock_name, sector, source_news_id, evidence
+        FROM company_sectors
+        """
+    ):
+        if f"name:{stock_name}" not in groups.parent:
+            continue
+        if sector not in sector_names:
+            raise ValueError(
+                f"Stored sector {sector!r} for {stock_name!r} is not in {sector_file}."
+            )
+        issuer = groups.issuer(stock_name)
+        previous = classified.get(issuer)
+        if previous is not None and previous[0] != sector:
+            raise ValueError(
+                f"Conflicting stored sectors for issuer group containing {stock_name!r}: "
+                f"{previous[0]!r} and {sector!r}."
+            )
+        classified[issuer] = (sector, news_id, evidence)
+
+    reports = connection.execute(
+        """
+        SELECT news_id, stock_name, document_text
+        FROM news
+        WHERE document_text IS NOT NULL
+          AND trim(stock_name) <> ''
+          AND (
+              lower(title) LIKE '%annual report%'
+              OR lower(title) LIKE '%interim report%'
+              OR lower(title) LIKE '%annual results%'
+              OR lower(title) LIKE '%interim results%'
+              OR lower(title) LIKE '%results announcement%'
+          )
+        ORDER BY release_time DESC
+        """
+    )
+    for news_id, stock_name, document_text in reports:
+        issuer = groups.issuer(stock_name)
+        if issuer in classified:
+            continue
+        result = classify_document_sector(document_text)
+        if result is not None:
+            sector, evidence = result
+            classified[issuer] = (sector, news_id, evidence)
+
+    classified_at = datetime.now(HK_TIMEZONE).isoformat()
+    assignments: list[tuple[str, str, str, str, str]] = []
+    for _, stock_name in issuer_rows:
+        match = classified.get(groups.issuer(stock_name))
+        if match is not None:
+            sector, news_id, evidence = match
+            assignments.append((stock_name, sector, news_id, evidence, classified_at))
+    connection.executemany(
+        """
+        INSERT INTO company_sectors (
+            stock_name, sector, source_news_id, evidence, classified_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(stock_name) DO NOTHING
+        """,
+        assignments,
+    )
+    connection.execute(
+        """
+        UPDATE news
+        SET sector = (
+            SELECT company_sectors.sector
+            FROM company_sectors
+            WHERE company_sectors.stock_name = news.stock_name
+        )
+        WHERE EXISTS (
+            SELECT 1 FROM company_sectors
+            WHERE company_sectors.stock_name = news.stock_name
+        )
+        """
+    )
+    connection.commit()
+    total_issuers = len({groups.issuer(name) for _, name in issuer_rows})
+    return len(classified), total_issuers
 
 
 def release_time(value: str) -> str:
@@ -115,6 +470,17 @@ def plain_text(value: str) -> str:
 
 def normalized_stock_codes(value: str) -> str:
     return " ".join(TAG_PATTERN.sub(" ", html.unescape(value)).split())
+
+
+MAX_STOCK_CODE = 10000
+
+
+def has_main_stock_code(row: dict[str, str]) -> bool:
+    """True when any listed code is below 10000, excluding warrants, CBBCs and debt-only notices."""
+    return any(
+        code.isdigit() and int(code) < MAX_STOCK_CODE
+        for code in normalized_stock_codes(row.get("STOCK_CODE", "")).split()
+    )
 
 
 def row_for_storage(row: dict[str, str], security_status: str) -> tuple[str, ...]:
@@ -174,13 +540,17 @@ def download_pdf_text(url: str) -> str:
     else:
         raise HKEXError(f"PDF download failed after 3 attempts: {url}") from last_error
     if len(content) > MAX_PDF_BYTES:
-        raise HKEXError(f"PDF exceeds the {MAX_PDF_BYTES // (1024 * 1024)} MiB download limit.")
+        raise PDFContentError(
+            f"PDF exceeds the {MAX_PDF_BYTES // (1024 * 1024)} MiB download limit."
+        )
     if not content.startswith(b"%PDF-"):
-        raise HKEXError("Downloaded document is not a PDF.")
+        raise PDFContentError("Downloaded document is not a PDF.")
     try:
-        return "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(content)).pages)
-    except PdfReadError as error:
-        raise HKEXError(f"Unable to extract text from PDF: {url}") from error
+        text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(content)).pages)
+        text.encode("utf-8")
+        return text
+    except (PdfReadError, UnicodeError) as error:
+        raise PDFContentError(f"Unable to extract text from PDF: {url}") from error
 
 
 def is_pdf_document(file_type: str, url: str) -> bool:
@@ -188,19 +558,66 @@ def is_pdf_document(file_type: str, url: str) -> bool:
     return file_type.strip().upper() == "PDF" or urlsplit(url).path.lower().endswith(".pdf")
 
 
+def mark_document_url_invalid(
+    connection: sqlite3.Connection, url: str, reason: str, ignored_at: str
+) -> None:
+    """Persist a terminal document failure for every record sharing its URL."""
+    connection.execute(
+        """
+        INSERT INTO invalid_document_urls (document_url, reason, ignored_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(document_url) DO UPDATE SET
+            reason = excluded.reason,
+            ignored_at = excluded.ignored_at
+        """,
+        (url, reason, ignored_at),
+    )
+    connection.execute(
+        """
+        UPDATE news
+        SET document_downloaded_at = ?, document_error = ?, document_ignored_at = ?
+        WHERE document_url = ? AND document_text IS NULL
+        """,
+        (ignored_at, reason, ignored_at, url),
+    )
+
+
 def store_document_text(connection: sqlite3.Connection, news_ids: list[str]) -> None:
-    """Populate text for newly discovered or previously failed document downloads."""
-    downloaded_count = 0
+    """Populate text for active securities in randomized concurrent batches."""
+    downloads: list[tuple[str, str]] = []
     for news_id in news_ids:
         row = connection.execute(
-            "SELECT document_url, file_type, document_text FROM news WHERE news_id = ?",
+            """
+            SELECT document_url, file_type, document_text, security_status,
+                   document_ignored_at
+            FROM news WHERE news_id = ?
+            """,
             (news_id,),
         ).fetchone()
         if row is None:
             continue
-        url, file_type, existing_text = row
+        url, file_type, existing_text, security_status, ignored_at = row
         if existing_text is not None:
             report(f"PDF {news_id}: skipped (already stored)")
+            continue
+        if ignored_at is not None:
+            report(f"PDF {news_id}: skipped (previously ignored)")
+            continue
+        invalid_url = connection.execute(
+            """
+            SELECT reason, ignored_at
+            FROM invalid_document_urls
+            WHERE document_url = ?
+            """,
+            (url,),
+        ).fetchone()
+        if invalid_url is not None:
+            reason, ignored_at = invalid_url
+            mark_document_url_invalid(connection, url, reason, ignored_at)
+            report(f"PDF {news_id}: skipped (invalid document URL)")
+            continue
+        if security_status != "current":
+            report(f"PDF {news_id}: skipped (delisted security)")
             continue
         downloaded_at = datetime.now(HK_TIMEZONE).isoformat()
         if not url:
@@ -227,32 +644,48 @@ def store_document_text(connection: sqlite3.Connection, news_ids: list[str]) -> 
             )
             connection.commit()
             continue
-        if downloaded_count:
-            delay = random.randint(1, 10)
-            report(f"PDF {news_id}: waiting {delay}s before download")
-            time.sleep(delay)
-        report(f"PDF {news_id}: downloading")
-        try:
-            text = download_pdf_text(url)
-        except HKEXError as error:
-            report(f"PDF {news_id}: failed: {error}")
-            connection.execute(
-                "UPDATE news SET document_error = ? WHERE news_id = ?",
-                (str(error), news_id),
-            )
-        else:
-            report(f"PDF {news_id}: stored {len(text):,} characters")
-            connection.execute(
-                """
-                UPDATE news
-                SET document_text = ?, document_downloaded_at = ?, document_error = NULL
-                WHERE news_id = ?
-                """,
-                (text, downloaded_at, news_id),
-            )
+        downloads.append((news_id, url))
+
+    while downloads:
+        batch_size = random.randint(1, 5)
+        batch, downloads = downloads[:batch_size], downloads[batch_size:]
+        report(f"PDF batch: downloading {len(batch)} document(s) simultaneously")
+        with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+            futures = {
+                news_id: executor.submit(download_pdf_text, url)
+                for news_id, url in batch
+            }
+            for news_id, url in batch:
+                downloaded_at = datetime.now(HK_TIMEZONE).isoformat()
+                try:
+                    text = futures[news_id].result()
+                except PDFContentError as error:
+                    report(f"PDF {news_id}: ignored: {error}")
+                    mark_document_url_invalid(connection, url, str(error), downloaded_at)
+                except HKEXError as error:
+                    report(f"PDF {news_id}: failed: {error}")
+                    connection.execute(
+                        "UPDATE news SET document_error = ? WHERE news_id = ?",
+                        (str(error), news_id),
+                    )
+                else:
+                    report(f"PDF {news_id}: stored {len(text):,} characters")
+                    try:
+                        connection.execute(
+                            """
+                            UPDATE news
+                            SET document_text = ?, document_downloaded_at = ?,
+                                document_error = NULL
+                            WHERE news_id = ?
+                            """,
+                            (text, downloaded_at, news_id),
+                        )
+                    except UnicodeError as error:
+                        reason = f"Unable to store PDF text as UTF-8: {error}"
+                        report(f"PDF {news_id}: ignored: {reason}")
+                        mark_document_url_invalid(connection, url, reason, downloaded_at)
         # Keep completed documents when an operator interrupts a long backfill.
         connection.commit()
-        downloaded_count += 1
 
 
 def backfill_document_text(connection: sqlite3.Connection) -> None:
@@ -264,6 +697,13 @@ def backfill_document_text(connection: sqlite3.Connection) -> None:
             SELECT news_id, file_type, document_url
             FROM news
             WHERE document_text IS NULL
+              AND document_ignored_at IS NULL
+              AND security_status = 'current'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM invalid_document_urls
+                  WHERE invalid_document_urls.document_url = news.document_url
+              )
             """
         )
         if is_pdf_document(file_type, url)
@@ -288,10 +728,12 @@ def sync(
     initial_from_date: date | None,
     to_date: date,
     backfill_pdfs: bool = False,
+    sector_file: Path = DEFAULT_SECTOR_FILE,
 ) -> list[SyncResult]:
     connection = connect(database)
     client = HKEXNewsClient()
     try:
+        load_sector_names(sector_file)
         report(
             f"Sync started: {', '.join(security_statuses)} records through "
             f"{to_date.isoformat()} into {database}"
@@ -332,8 +774,12 @@ def sync(
                 sort_by="DateTime",
                 sort_order="desc",
             )
-            records = client.search_all(criteria)
-            report(f"Sync {security_status}: received {len(records):,} records")
+            received = client.search_all(criteria)
+            records = [record for record in received if has_main_stock_code(record)]
+            report(
+                f"Sync {security_status}: received {len(received):,} records, "
+                f"kept {len(records):,} with a stock code below {MAX_STOCK_CODE}"
+            )
             connection.executemany(
                 UPSERT_NEWS,
                 (row_for_storage(record, security_status) for record in records),
@@ -356,6 +802,8 @@ def sync(
             results.append(SyncResult(security_status, from_date, to_date, len(records)))
         if backfill_pdfs:
             backfill_document_text(connection)
+        matched, total = classify_company_sectors(connection, sector_file)
+        report(f"Sector classification: matched {matched:,} of {total:,} issuers")
         report("Sync complete")
         return results
     finally:
@@ -371,13 +819,15 @@ def create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "command",
-        choices=("sync", "backfill-pdfs"),
+        choices=("sync", "backfill-pdfs", "classify-sectors"),
         help=(
             "sync downloads new records and upserts the overlap from the prior sync date; "
-            "backfill-pdfs processes every stored PDF missing extracted text."
+            "backfill-pdfs processes every stored PDF missing extracted text; "
+            "classify-sectors analyzes reports and propagates issuer sectors."
         ),
     )
     parser.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
+    parser.add_argument("--sector-file", type=Path, default=DEFAULT_SECTOR_FILE)
     parser.add_argument(
         "--log-file",
         type=Path,
@@ -388,13 +838,13 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--security-status",
         choices=("all", "current", "delisted"),
-        default="all",
-        help="Security lists to download; default: all.",
+        default="current",
+        help="Security lists to download; default: current.",
     )
     parser.add_argument(
         "--backfill-pdfs",
         action="store_true",
-        help="Download PDFs for all existing records that do not yet have extracted text.",
+        help="Download PDFs for current-security records that do not yet have extracted text.",
     )
     return parser
 
@@ -413,10 +863,33 @@ def main() -> int:
             connection = connect(args.database)
             try:
                 backfill_document_text(connection)
+                matched, total = classify_company_sectors(connection, args.sector_file)
             finally:
                 connection.close()
+            report(
+                f"Sector classification: matched {matched:,} of {total:,} issuers",
+                stream=sys.stdout,
+            )
             return 0
-        results = sync(args.database, statuses, args.from_date, to_date, args.backfill_pdfs)
+        if args.command == "classify-sectors":
+            connection = connect(args.database)
+            try:
+                matched, total = classify_company_sectors(connection, args.sector_file)
+            finally:
+                connection.close()
+            report(
+                f"Sector classification: matched {matched:,} of {total:,} issuers",
+                stream=sys.stdout,
+            )
+            return 0
+        results = sync(
+            args.database,
+            statuses,
+            args.from_date,
+            to_date,
+            args.backfill_pdfs,
+            args.sector_file,
+        )
     except KeyboardInterrupt:
         report("Interrupted: completed document updates have been saved.")
         return 130
